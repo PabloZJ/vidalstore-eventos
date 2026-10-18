@@ -3,6 +3,9 @@ import { AppModule } from './app.module.js';
 
 async function bootstrap() {
   const app = await NestFactory.create(AppModule);
-  await app.listen(process.env.PORT ?? 3000);
+  const port = process.env.PORT ? Number(process.env.PORT) : 3010;
+  await app.listen(port);
+  console.log(`vidalstore-eventos escuchando en el puerto ${port}`);
 }
-await bootstrap();
+
+bootstrap();
