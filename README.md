@@ -50,3 +50,11 @@ npm test
 docker build -t vidalstore-eventos .
 docker run --env-file .env -p 3010:3010 vidalstore-eventos
 ```
+
+## Topologia
+
+El servicio consume el exchange `vidalstore.eventos` y persiste los eventos recibidos en PostgreSQL. Las colas de auditoria, avisos y correos tienen sus respectivas colas de mensajes muertos para reintentos agotados.
+
+## Estado del repositorio
+
+La rama `main` contiene la version publicada del servicio. La rama `develop` se utiliza para integrar cambios antes de crear una release.
