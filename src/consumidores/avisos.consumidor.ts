@@ -4,6 +4,7 @@ import { DatabaseService } from '../database/database.service.js';
 import { MensajeInvalido, MensajeService } from '../mensajeria/mensaje.service.js';
 import { RabbitmqService } from '../mensajeria/rabbitmq.service.js';
 import { EXCHANGES, QUEUES, ROUTING_KEYS } from '../mensajeria/topologia.js';
+import { esDelMensaje, detalle } from '../mensajeria/reintentos.js';
 
 @Injectable()
 export class AvisosConsumidor implements OnApplicationBootstrap {
@@ -37,9 +38,13 @@ export class AvisosConsumidor implements OnApplicationBootstrap {
       await channel.waitForConfirms();
       channel.ack(msg);
     } catch (error) {
-      this.logger.error('[AVISOS] falla:', error);
-      if (error instanceof SyntaxError || error instanceof MensajeInvalido) channel.nack(msg, false, false);
-      else await this.mensajes.reintentar(channel, msg);
+      this.logger.error(`[AVISOS] falla: ${detalle(error)}`);
+      if (esDelMensaje(error)) {
+        this.logger.error('Error determinista, enviando a DLQ sin reintentos');
+        channel.reject(msg, false);
+      } else {
+        await this.mensajes.reintentar(channel, msg);
+      }
     }
   }
 }
