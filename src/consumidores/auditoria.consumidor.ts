@@ -1,9 +1,10 @@
 import { Injectable, Logger, OnApplicationBootstrap } from '@nestjs/common';
 import type { ConfirmChannel, ConsumeMessage } from 'amqplib';
 import { DatabaseService } from '../database/database.service.js';
-import { MensajeInvalido, MensajeService } from '../mensajeria/mensaje.service.js';
+import { MensajeService } from '../mensajeria/mensaje.service.js';
 import { RabbitmqService } from '../mensajeria/rabbitmq.service.js';
 import { QUEUES } from '../mensajeria/topologia.js';
+import { esDelMensaje, detalle } from '../mensajeria/reintentos.js';
 
 @Injectable()
 export class AuditoriaConsumidor implements OnApplicationBootstrap {
@@ -32,9 +33,13 @@ export class AuditoriaConsumidor implements OnApplicationBootstrap {
       );
       channel.ack(msg);
     } catch (error) {
-      this.logger.error(`[AUDITORIA] falla procesando ${routingKey}:`, error);
-      if (error instanceof SyntaxError || error instanceof MensajeInvalido) channel.nack(msg, false, false);
-      else await this.mensajes.reintentar(channel, msg);
+      this.logger.error(`[AUDITORIA] falla procesando ${routingKey}: ${detalle(error)}`);
+      if (esDelMensaje(error)) {
+        this.logger.error('Error determinista, enviando a DLQ sin reintentos');
+        channel.reject(msg, false);
+      } else {
+        await this.mensajes.reintentar(channel, msg);
+      }
     }
   }
 }
