@@ -1,7 +1,7 @@
 import { Injectable, Logger, OnApplicationBootstrap } from '@nestjs/common';
 import type { ConfirmChannel, ConsumeMessage } from 'amqplib';
 import { DatabaseService } from '../database/database.service.js';
-import { MensajeInvalido, MensajeService } from '../mensajeria/mensaje.service.js';
+import { MensajeService } from '../mensajeria/mensaje.service.js';
 import { RabbitmqService } from '../mensajeria/rabbitmq.service.js';
 import { EXCHANGES, QUEUES, ROUTING_KEYS } from '../mensajeria/topologia.js';
 import { esDelMensaje, detalle } from '../mensajeria/reintentos.js';
