@@ -1,16 +1,17 @@
-import { Module, Controller, Get, OnModuleInit, Logger } from '@nestjs/common';
-import { randomUUID } from 'crypto';
+import { Module, Controller, Get, OnModuleInit, Logger, Inject } from '@nestjs/common';
 import amqp, { Channel, ChannelModel } from 'amqplib';
 import pg from 'pg';
 import {
   EXCHANGES,
   QUEUES,
-  BINDINGS,
-  DLX_ROUTING_KEYS,
+  ROUTING_KEYS,
+  declararTopologia,
 } from './mensajeria/topologia.js';
 
 const { Pool } = pg;
 const MAX_INTENTOS = 3;
+
+class MensajeInvalido extends Error {}
 
 function crearPool() {
   return new Pool({
@@ -45,11 +46,12 @@ export class HealthController {
 export class AppModule implements OnModuleInit {
   private readonly logger = new Logger(AppModule.name);
   private pool = crearPool();
-  private healthCtrl?: HealthController;
+
+  constructor(@Inject(HealthController) private readonly healthCtrl: HealthController) {}
 
   async onModuleInit() {
     await this.initTablas();
-    this.iniciarConsumidor();
+    this.iniciarConsumidores();
   }
 
   private async initTablas() {
@@ -64,14 +66,17 @@ export class AppModule implements OnModuleInit {
         recibido_en TIMESTAMPTZ NOT NULL DEFAULT NOW()
       );
 
-      CREATE TABLE IF NOT EXISTS notificaciones (
+       CREATE TABLE IF NOT EXISTS notificaciones (
         id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
         para       VARCHAR(200) NOT NULL,
         asunto     TEXT NOT NULL,
         estado     VARCHAR(20) NOT NULL DEFAULT 'enviada' CHECK (estado IN ('enviada','fallida')),
         evento_id  UUID NOT NULL,
-        creada_en  TIMESTAMPTZ NOT NULL DEFAULT NOW()
-      );
+         creada_en  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+       );
+
+       CREATE UNIQUE INDEX IF NOT EXISTS notificaciones_evento_tipo_unico
+         ON notificaciones (evento_id, asunto);
 
       CREATE TABLE IF NOT EXISTS mensajes_muertos (
         id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -86,41 +91,33 @@ export class AppModule implements OnModuleInit {
     this.logger.log('Tablas de vidalstore-eventos verificadas/creadas');
   }
 
-  private async iniciarConsumidor() {
+  private async iniciarConsumidores() {
     const url = process.env.RABBITMQ_URL || 'amqp://vidalstore:vidalstore@rabbitmq:5672';
     try {
       const conn: ChannelModel = await amqp.connect(url);
       const ch: Channel = await conn.createChannel();
       ch.prefetch(1);
-      if (this.healthCtrl) this.healthCtrl.setRabbitOk(true);
+      this.healthCtrl.setRabbitOk(true);
 
-      await ch.assertExchange(EXCHANGES.EVENTOS, 'topic',  { durable: true });
-      await ch.assertExchange(EXCHANGES.DLX,     'direct', { durable: true });
-
-      for (const [q, rk] of [
-        [QUEUES.AVISOS_DLQ,    DLX_ROUTING_KEYS.AVISOS],
-        [QUEUES.AUDITORIA_DLQ, DLX_ROUTING_KEYS.AUDITORIA],
-        [QUEUES.CORREOS_DLQ,   DLX_ROUTING_KEYS.CORREOS],
-      ] as [string, string][]) {
-        await ch.assertQueue(q, { durable: true });
-        ch.bindQueue(q, EXCHANGES.DLX, rk);
-      }
-
-      const dlxArgs = (rk: string) => ({
-        'x-dead-letter-exchange':    EXCHANGES.DLX,
-        'x-dead-letter-routing-key': rk,
-      });
-      await ch.assertQueue(QUEUES.AVISOS,    { durable: true, arguments: dlxArgs(DLX_ROUTING_KEYS.AVISOS) });
-      await ch.assertQueue(QUEUES.AUDITORIA, { durable: true, arguments: dlxArgs(DLX_ROUTING_KEYS.AUDITORIA) });
-      await ch.assertQueue(QUEUES.CORREOS,   { durable: true, arguments: dlxArgs(DLX_ROUTING_KEYS.CORREOS) });
-
-      ch.bindQueue(QUEUES.AVISOS,    EXCHANGES.EVENTOS, BINDINGS.AVISOS_PATTERN);
-      ch.bindQueue(QUEUES.AUDITORIA, EXCHANGES.EVENTOS, BINDINGS.AUDITORIA_PATTERN);
-      ch.bindQueue(QUEUES.CORREOS,   EXCHANGES.EVENTOS, BINDINGS.CORREOS_PATTERN);
+       await declararTopologia(ch);
 
       this.logger.log('Topología RabbitMQ configurada');
 
-      ch.consume(QUEUES.AUDITORIA, async (msg) => {
+      this.consumirAuditoria(ch);
+      this.consumirAvisos(ch);
+      this.consumirCorreos(ch);
+      this.consumirDlq(ch);
+
+      conn.on('error', () => this.healthCtrl.setRabbitOk(false));
+    } catch (err) {
+      this.logger.error('Error conectando a RabbitMQ, reintentando en 5s...', err);
+      this.healthCtrl.setRabbitOk(false);
+      setTimeout(() => this.iniciarConsumidores(), 5000);
+    }
+  }
+
+  private consumirAuditoria(ch: Channel) {
+    ch.consume(QUEUES.AUDITORIA, async (msg) => {
         if (!msg) return;
         const routingKey = msg.fields.routingKey;
         try {
@@ -129,8 +126,8 @@ export class AppModule implements OnModuleInit {
           try { payload = JSON.parse(raw); }
           catch { ch.nack(msg, false, false); return; } // malformado → DLX sin reintento
 
-          const eventoId  = (msg.properties.headers?.['x-evento-id']  as string) ?? randomUUID();
-          const emitidoEn = (msg.properties.headers?.['x-emitido-en'] as string) ?? null;
+           const eventoId = this.eventoId(msg);
+           const emitidoEn = this.emitidoEn(msg);
           const usuarioSub = (msg.properties.headers?.['x-usuario-sub'] as string) ?? null;
 
           await this.pool.query(
@@ -142,12 +139,14 @@ export class AppModule implements OnModuleInit {
           ch.ack(msg);
         } catch (err) {
           this.logger.error(`[AUDITORIA] falla procesando ${routingKey}:`, err);
-          const intentos = ((msg.properties.headers?.['x-death'] as any[])?.[0]?.count ?? 0) + 1;
-          ch.nack(msg, false, intentos < MAX_INTENTOS); // reintento acotado
+          if (err instanceof MensajeInvalido) { ch.nack(msg, false, false); return; }
+          this.reintentar(ch, msg);
         }
-      });
+    });
+  }
 
-      ch.consume(QUEUES.AVISOS, async (msg) => {
+  private consumirAvisos(ch: Channel) {
+    ch.consume(QUEUES.AVISOS, async (msg) => {
         if (!msg) return;
         try {
           const raw = msg.content.toString();
@@ -155,23 +154,37 @@ export class AppModule implements OnModuleInit {
           try { payload = JSON.parse(raw); }
           catch { ch.nack(msg, false, false); return; }
 
-          const eventoId  = (msg.properties.headers?.['x-evento-id'] as string) ?? randomUUID();
-          const para = payload.usuario_sub ?? payload.usuarioSub ?? 'desconocido';
+           const eventoId = this.eventoId(msg);
+           this.emitidoEn(msg);
+           const para = this.destinatario(payload);
+           const asunto = `Aviso: ${msg.fields.routingKey}`;
 
           await this.pool.query(
-            `INSERT INTO notificaciones (para, asunto, estado, evento_id)
-             VALUES ($1, $2, 'enviada', $3)`,
-            [para, `Aviso: ${msg.fields.routingKey}`, eventoId],
-          );
+             `INSERT INTO notificaciones (para, asunto, estado, evento_id)
+              VALUES ($1, $2, 'enviada', $3)
+              ON CONFLICT (evento_id, asunto) DO NOTHING`,
+             [para, asunto, eventoId],
+           );
+           ch.publish(EXCHANGES.COMANDOS.nombre, ROUTING_KEYS.CORREO_ENVIAR, Buffer.from(JSON.stringify({
+             para,
+             asunto,
+             eventoIdOrigen: eventoId,
+           })), {
+             persistent: true,
+             contentType: 'application/json',
+             headers: { 'x-evento-id': eventoId, 'x-emitido-en': new Date().toISOString() },
+           });
           ch.ack(msg);
         } catch (err) {
           this.logger.error('[AVISOS] falla:', err);
-          const intentos = ((msg.properties.headers?.['x-death'] as any[])?.[0]?.count ?? 0) + 1;
-          ch.nack(msg, false, intentos < MAX_INTENTOS);
+          if (err instanceof MensajeInvalido) { ch.nack(msg, false, false); return; }
+          this.reintentar(ch, msg);
         }
-      });
+    });
+  }
 
-      ch.consume(QUEUES.CORREOS, async (msg) => {
+  private consumirCorreos(ch: Channel) {
+    ch.consume(QUEUES.CORREOS, async (msg) => {
         if (!msg) return;
         try {
           const raw = msg.content.toString();
@@ -179,24 +192,29 @@ export class AppModule implements OnModuleInit {
           try { payload = JSON.parse(raw); }
           catch { ch.nack(msg, false, false); return; }
 
-          const eventoId = (msg.properties.headers?.['x-evento-id'] as string) ?? randomUUID();
-          const para = payload.usuario_sub ?? payload.usuarioSub ?? 'desconocido';
+           const eventoId = this.eventoId(msg);
+           this.emitidoEn(msg);
+           const para = this.destinatario(payload);
+            if (typeof payload.asunto !== 'string' || payload.asunto.length === 0) throw new MensajeInvalido('El comando no trae asunto');
 
           await this.pool.query(
-            `INSERT INTO notificaciones (para, asunto, estado, evento_id)
-             VALUES ($1, 'Confirmación de compra', 'enviada', $2)`,
-            [para, eventoId],
+             `INSERT INTO notificaciones (para, asunto, estado, evento_id)
+              VALUES ($1, $2, 'enviada', $3)
+              ON CONFLICT (evento_id, asunto) DO NOTHING`,
+             [para, payload.asunto, eventoId],
           );
           ch.ack(msg);
         } catch (err) {
           this.logger.error('[CORREOS] falla:', err);
-          const intentos = ((msg.properties.headers?.['x-death'] as any[])?.[0]?.count ?? 0) + 1;
-          ch.nack(msg, false, intentos < MAX_INTENTOS);
+          if (err instanceof MensajeInvalido) { ch.nack(msg, false, false); return; }
+          this.reintentar(ch, msg);
         }
-      });
+    });
+  }
 
-      for (const cola of [QUEUES.AVISOS_DLQ, QUEUES.AUDITORIA_DLQ, QUEUES.CORREOS_DLQ]) {
-        ch.consume(cola, async (msg) => {
+  private consumirDlq(ch: Channel) {
+    for (const cola of [QUEUES.AVISOS_DLQ, QUEUES.AUDITORIA_DLQ, QUEUES.CORREOS_DLQ]) {
+      ch.consume(cola, async (msg) => {
           if (!msg) return;
           try {
             const xDeath = msg.properties.headers?.['x-death'] as any[];
@@ -210,16 +228,57 @@ export class AppModule implements OnModuleInit {
             ch.ack(msg);
           } catch (err) {
             this.logger.error(`[DLQ ${cola}] falla:`, err);
-            ch.nack(msg, false, false);
+            // No perder la evidencia de un fallo si PostgreSQL no esta disponible.
+            ch.nack(msg, false, true);
           }
-        });
-      }
-
-      conn.on('error', () => { if (this.healthCtrl) this.healthCtrl.setRabbitOk(false); });
-    } catch (err) {
-      this.logger.error('Error conectando a RabbitMQ, reintentando en 5s...', err);
-      if (this.healthCtrl) this.healthCtrl.setRabbitOk(false);
-      setTimeout(() => this.iniciarConsumidor(), 5000);
+      });
     }
+  }
+
+  /**
+   * Re-publica el mensaje con un contador persistente en sus headers.
+   * x-death no aumenta con nack(..., requeue=true), por lo que no sirve para
+   * acotar reintentos. Al agotarse el límite se rechaza hacia su DLQ.
+   */
+  private reintentar(ch: Channel, msg: import('amqplib').ConsumeMessage) {
+    const headers = { ...(msg.properties.headers ?? {}) } as Record<string, unknown>;
+    const intentos = Number(headers['x-reintentos'] ?? 0) + 1;
+    if (intentos >= MAX_INTENTOS) {
+      ch.nack(msg, false, false);
+      return;
+    }
+
+    headers['x-reintentos'] = intentos;
+     const exchange = msg.fields.exchange || EXCHANGES.EVENTOS.nombre;
+     ch.publish(exchange, msg.fields.routingKey, msg.content, {
+      persistent: true,
+      contentType: msg.properties.contentType ?? 'application/json',
+      messageId: msg.properties.messageId,
+      headers,
+    });
+     ch.ack(msg);
+   }
+
+  private eventoId(msg: import('amqplib').ConsumeMessage): string {
+    const value = msg.properties.headers?.['x-evento-id'];
+    if (typeof value !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value)) {
+      throw new MensajeInvalido('El mensaje no trae un x-evento-id UUID valido');
+    }
+    return value;
+  }
+
+  private emitidoEn(msg: import('amqplib').ConsumeMessage): string {
+    const value = msg.properties.headers?.['x-emitido-en'];
+    if (typeof value !== 'string' || Number.isNaN(Date.parse(value))) {
+      throw new MensajeInvalido('El mensaje no trae un x-emitido-en ISO-8601 valido');
+    }
+    return value;
+  }
+
+  private destinatario(payload: unknown): string {
+    if (!payload || typeof payload !== 'object') throw new MensajeInvalido('El payload no es un objeto');
+    const value = (payload as Record<string, unknown>).usuario_sub ?? (payload as Record<string, unknown>).usuarioSub ?? (payload as Record<string, unknown>).para;
+    if (typeof value !== 'string' || value.length === 0) throw new MensajeInvalido('El mensaje no trae destinatario');
+    return value;
   }
 }
