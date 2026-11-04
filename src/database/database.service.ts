@@ -1,4 +1,5 @@
 import { Injectable, Logger, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import pg from 'pg';
 
 const { Pool } = pg;
@@ -6,13 +7,17 @@ const { Pool } = pg;
 @Injectable()
 export class DatabaseService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(DatabaseService.name);
-  private readonly pool = new Pool({
-    host: process.env.DB_HOST || 'postgres',
-    port: Number(process.env.DB_PORT) || 5432,
-    user: process.env.DB_USER || 'vidalstore',
-    password: process.env.DB_PASSWORD || 'vidalstore',
-    database: process.env.DB_NAME || 'vidalstore',
-  });
+  private readonly pool: pg.Pool;
+
+  constructor(config: ConfigService) {
+    this.pool = new Pool({
+      host: config.get<string>('DB_HOST') ?? 'postgres',
+      port: Number(config.get<string>('DB_PORT') ?? 5432),
+      user: config.get<string>('DB_USER') ?? 'vidalstore',
+      password: config.get<string>('DB_PASSWORD') ?? 'vidalstore',
+      database: config.get<string>('DB_NAME') ?? 'vidalstore',
+    });
+  }
 
   async onModuleInit(): Promise<void> {
     await this.pool.query(`
