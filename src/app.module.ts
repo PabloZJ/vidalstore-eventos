@@ -7,6 +7,7 @@ import { CorreosModule } from './consumidores/correos.module.js';
 import { DatabaseModule } from './database/database.module.js';
 import { HealthModule } from './health/health.module.js';
 import { MensajeriaModule } from './mensajeria/mensajeria.module.js';
+import { StreamingModule } from './streaming/streaming.module.js';
 
 @Module({
   imports: [
@@ -18,6 +19,7 @@ import { MensajeriaModule } from './mensajeria/mensajeria.module.js';
     AvisosModule,
     CorreosModule,
     CartasMuertasModule,
+    StreamingModule,
   ],
 })
 export class AppModule {}
