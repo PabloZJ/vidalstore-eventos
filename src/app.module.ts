@@ -1,5 +1,5 @@
 import { Module, Controller, Get, OnModuleInit, Logger, Inject } from '@nestjs/common';
-import amqp, { Channel, ChannelModel } from 'amqplib';
+import amqp, { ConfirmChannel, ChannelModel } from 'amqplib';
 import pg from 'pg';
 import {
   EXCHANGES,
@@ -95,7 +95,7 @@ export class AppModule implements OnModuleInit {
     const url = process.env.RABBITMQ_URL || 'amqp://vidalstore:vidalstore@rabbitmq:5672';
     try {
       const conn: ChannelModel = await amqp.connect(url);
-      const ch: Channel = await conn.createChannel();
+      const ch: ConfirmChannel = await conn.createConfirmChannel();
       ch.prefetch(1);
       this.healthCtrl.setRabbitOk(true);
 
@@ -109,6 +109,10 @@ export class AppModule implements OnModuleInit {
       this.consumirDlq(ch);
 
       conn.on('error', () => this.healthCtrl.setRabbitOk(false));
+      conn.on('close', () => {
+        this.healthCtrl.setRabbitOk(false);
+        setTimeout(() => this.iniciarConsumidores(), 5000);
+      });
     } catch (err) {
       this.logger.error('Error conectando a RabbitMQ, reintentando en 5s...', err);
       this.healthCtrl.setRabbitOk(false);
@@ -116,7 +120,7 @@ export class AppModule implements OnModuleInit {
     }
   }
 
-  private consumirAuditoria(ch: Channel) {
+  private consumirAuditoria(ch: ConfirmChannel) {
     ch.consume(QUEUES.AUDITORIA, async (msg) => {
         if (!msg) return;
         const routingKey = msg.fields.routingKey;
@@ -140,12 +144,12 @@ export class AppModule implements OnModuleInit {
         } catch (err) {
           this.logger.error(`[AUDITORIA] falla procesando ${routingKey}:`, err);
           if (err instanceof MensajeInvalido) { ch.nack(msg, false, false); return; }
-          this.reintentar(ch, msg);
+          await this.reintentar(ch, msg);
         }
-    });
+    }, { noAck: false });
   }
 
-  private consumirAvisos(ch: Channel) {
+  private consumirAvisos(ch: ConfirmChannel) {
     ch.consume(QUEUES.AVISOS, async (msg) => {
         if (!msg) return;
         try {
@@ -174,16 +178,17 @@ export class AppModule implements OnModuleInit {
              contentType: 'application/json',
              headers: { 'x-evento-id': eventoId, 'x-emitido-en': new Date().toISOString() },
            });
+          await ch.waitForConfirms();
           ch.ack(msg);
         } catch (err) {
           this.logger.error('[AVISOS] falla:', err);
           if (err instanceof MensajeInvalido) { ch.nack(msg, false, false); return; }
-          this.reintentar(ch, msg);
+          await this.reintentar(ch, msg);
         }
-    });
+    }, { noAck: false });
   }
 
-  private consumirCorreos(ch: Channel) {
+  private consumirCorreos(ch: ConfirmChannel) {
     ch.consume(QUEUES.CORREOS, async (msg) => {
         if (!msg) return;
         try {
@@ -207,12 +212,12 @@ export class AppModule implements OnModuleInit {
         } catch (err) {
           this.logger.error('[CORREOS] falla:', err);
           if (err instanceof MensajeInvalido) { ch.nack(msg, false, false); return; }
-          this.reintentar(ch, msg);
+          await this.reintentar(ch, msg);
         }
-    });
+    }, { noAck: false });
   }
 
-  private consumirDlq(ch: Channel) {
+  private consumirDlq(ch: ConfirmChannel) {
     for (const cola of [QUEUES.AVISOS_DLQ, QUEUES.AUDITORIA_DLQ, QUEUES.CORREOS_DLQ]) {
       ch.consume(cola, async (msg) => {
           if (!msg) return;
@@ -220,18 +225,20 @@ export class AppModule implements OnModuleInit {
             const xDeath = msg.properties.headers?.['x-death'] as any[];
             const intentos = xDeath?.[0]?.count ?? 1;
             const motivo   = xDeath?.[0]?.reason ?? 'nack';
+            const routingKey = xDeath?.[0]?.['routing-keys']?.[0] ?? msg.fields.routingKey;
             await this.pool.query(
               `INSERT INTO mensajes_muertos (cola_origen, routing_key, motivo, intentos, payload)
                VALUES ($1, $2, $3, $4, $5)`,
-              [cola, msg.fields.routingKey, motivo, intentos, msg.content.toString()],
+              [cola, routingKey, motivo, intentos, msg.content.toString()],
             );
+            this.logger.log(`[DLQ] registrada cola=${cola} routingKey=${routingKey} motivo=${motivo} intentos=${intentos}`);
             ch.ack(msg);
           } catch (err) {
             this.logger.error(`[DLQ ${cola}] falla:`, err);
             // No perder la evidencia de un fallo si PostgreSQL no esta disponible.
             ch.nack(msg, false, true);
           }
-      });
+      }, { noAck: false });
     }
   }
 
@@ -240,7 +247,7 @@ export class AppModule implements OnModuleInit {
    * x-death no aumenta con nack(..., requeue=true), por lo que no sirve para
    * acotar reintentos. Al agotarse el límite se rechaza hacia su DLQ.
    */
-  private reintentar(ch: Channel, msg: import('amqplib').ConsumeMessage) {
+  private async reintentar(ch: ConfirmChannel, msg: import('amqplib').ConsumeMessage) {
     const headers = { ...(msg.properties.headers ?? {}) } as Record<string, unknown>;
     const intentos = Number(headers['x-reintentos'] ?? 0) + 1;
     if (intentos >= MAX_INTENTOS) {
@@ -256,6 +263,7 @@ export class AppModule implements OnModuleInit {
       messageId: msg.properties.messageId,
       headers,
     });
+    await ch.waitForConfirms();
      ch.ack(msg);
    }
 
