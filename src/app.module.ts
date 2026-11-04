@@ -1,19 +1,23 @@
 import { Module } from '@nestjs/common';
-import { ConsumidoresService } from './consumidores/consumidores.service.js';
-import { DatabaseService } from './database/database.service.js';
-import { HealthController } from './health/health.controller.js';
-import { HealthStatusService } from './health/health-status.service.js';
-import { MensajeService } from './mensajeria/mensaje.service.js';
-import { RabbitmqService } from './mensajeria/rabbitmq.service.js';
+import { ConfigModule } from '@nestjs/config';
+import { AuditoriaModule } from './consumidores/auditoria.module.js';
+import { AvisosModule } from './consumidores/avisos.module.js';
+import { CartasMuertasModule } from './consumidores/cartas-muertas.module.js';
+import { CorreosModule } from './consumidores/correos.module.js';
+import { DatabaseModule } from './database/database.module.js';
+import { HealthModule } from './health/health.module.js';
+import { MensajeriaModule } from './mensajeria/mensajeria.module.js';
 
 @Module({
-  controllers: [HealthController],
-  providers: [
-    DatabaseService,
-    HealthStatusService,
-    MensajeService,
-    ConsumidoresService,
-    RabbitmqService,
+  imports: [
+    ConfigModule.forRoot({ isGlobal: true }),
+    DatabaseModule,
+    HealthModule,
+    MensajeriaModule,
+    AuditoriaModule,
+    AvisosModule,
+    CorreosModule,
+    CartasMuertasModule,
   ],
 })
 export class AppModule {}

@@ -1,6 +1,6 @@
 import { Injectable, Logger, OnApplicationBootstrap, OnModuleDestroy } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import amqp, { type ChannelModel, type ConfirmChannel } from 'amqplib';
-import { ConsumidoresService } from '../consumidores/consumidores.service.js';
 import { HealthStatusService } from '../health/health-status.service.js';
 import { declararTopologia } from './topologia.js';
 
@@ -10,11 +10,15 @@ export class RabbitmqService implements OnApplicationBootstrap, OnModuleDestroy 
   private connection: ChannelModel | null = null;
   private reconnectTimer: NodeJS.Timeout | null = null;
   private closing = false;
+  private channel: ConfirmChannel | null = null;
+  private readonly inicializadores: Array<(channel: ConfirmChannel) => void> = [];
 
-  constructor(
-    private readonly consumidores: ConsumidoresService,
-    private readonly healthStatus: HealthStatusService,
-  ) {}
+  constructor(private readonly healthStatus: HealthStatusService, private readonly config: ConfigService) {}
+
+  registrarConsumidor(inicializador: (channel: ConfirmChannel) => void): void {
+    this.inicializadores.push(inicializador);
+    if (this.channel) inicializador(this.channel);
+  }
 
   onApplicationBootstrap(): void {
     void this.conectar();
@@ -27,15 +31,16 @@ export class RabbitmqService implements OnApplicationBootstrap, OnModuleDestroy 
   }
 
   private async conectar(): Promise<void> {
-    const url = process.env.RABBITMQ_URL || 'amqp://vidalstore:vidalstore@rabbitmq:5672';
+    const url = this.config.get<string>('RABBITMQ_URL') ?? 'amqp://vidalstore:vidalstore@rabbitmq:5672';
     try {
       const connection = await amqp.connect(url);
       const channel: ConfirmChannel = await connection.createConfirmChannel();
       channel.prefetch(1);
       await declararTopologia(channel);
       this.connection = connection;
+      this.channel = channel;
       this.healthStatus.setRabbitOk(true);
-      this.consumidores.iniciar(channel);
+      this.inicializadores.forEach((inicializador) => inicializador(channel));
       this.logger.log('Topologia RabbitMQ configurada y consumidores iniciados');
       connection.on('error', () => this.healthStatus.setRabbitOk(false));
       connection.on('close', () => this.programarReconexion());
@@ -47,6 +52,7 @@ export class RabbitmqService implements OnApplicationBootstrap, OnModuleDestroy 
 
   private programarReconexion(): void {
     this.healthStatus.setRabbitOk(false);
+    this.channel = null;
     if (this.closing || this.reconnectTimer) return;
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = null;

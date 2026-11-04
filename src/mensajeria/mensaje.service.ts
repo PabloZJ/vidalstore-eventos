@@ -33,7 +33,7 @@ export class MensajeService {
   }
 
   async reintentar(channel: ConfirmChannel, msg: ConsumeMessage): Promise<void> {
-    const headers = { ...(msg.properties.headers ?? {}) } as Record<string, unknown>;
+    const headers = { ...msg.properties.headers } as Record<string, unknown>;
     const intentos = Number(headers['x-reintentos'] ?? 0) + 1;
     if (intentos >= MensajeService.maxIntentos) {
       channel.nack(msg, false, false);
